@@ -12,7 +12,8 @@ import {
 import { BUILTIN, fmt, uiFor, uiTemplate } from './i18n.mjs';
 import { DEFAULT_LOOK_ID, LOOKS, findLook, lookName, lookProblems, lookSnapshot } from './looks.mjs';
 import { flattenAlpha } from './png.mjs';
-import { CONFIG_PATH, configMissing, generate, loadConfig, maskConfig, modelKind, saveConfig } from './models.mjs';
+import { CONFIG_PATH, configMissing, generate, loadConfig, maskConfig, modelKind, qwenEndpoint, saveConfig, usesLocalGpu } from './models.mjs';
+import { leaseCommand, leaseSettings, withLease } from './gpu-lease.mjs';
 
 const readJson = (p) => JSON.parse(readFileSync(resolve(p), 'utf8'));
 
@@ -84,10 +85,25 @@ async function genViews(assetPath, viewIds, opts) {
   const oid = opts.outfit;
   const outfit = asset.outfits[oid];
   if (!outfit) throw new Error(`没有造型 ${oid}`);
+  const modelOf = (view) => opts.model ?? (view === ANCHOR ? cfg.anchorModel : cfg.deriveModel);
+  // 这批里有一张在本机 GPU 上出（qwen / 本地自定义命令）：整批只向 Strata 借一次 GPU，出完一起还
+  const local = viewIds.some((v) => usesLocalGpu(modelOf(v), cfg));
+  const run = () => genLoop(asset, assetPath, dir, viewIds, opts, cfg, modelOf);
+  return local ? withLease(leaseSettings(cfg.strataLease), comfyOf(cfg), run, { holder: 'character-refs' }) : run();
+}
+
+/** 本机 ComfyUI 的地址（归还 GPU 前让它释放显存）；没配 qwen 就是 null。 */
+function comfyOf(cfg) {
+  try { return qwenEndpoint(cfg.models.qwen); } catch { return null; }
+}
+
+async function genLoop(asset, assetPath, dir, viewIds, opts, cfg, modelOf) {
+  const oid = opts.outfit;
+  const outfit = asset.outfits[oid];
   let failed = 0;
   for (const view of viewIds) {
     const isAnchor = view === ANCHOR;
-    const model = opts.model ?? (isAnchor ? cfg.anchorModel : cfg.deriveModel);
+    const model = modelOf(view);
     modelKind(model);
     if (!isAnchor) {
       const u = anchorUsable(asset, oid);
@@ -293,7 +309,12 @@ const USAGE = `character-refs.mjs —— 角色参考图
          [--confirm-anchor yes|no]         出完锚点是否停下来等人确认
          [--qwen-env-file 路径] [--qwen-url 地址] [--codex-bin 路径]
          [--openai-env-file 路径] [--openai-base-url 地址] [--openai-model 名字]
-         [--custom 名字=命令模板]
+         [--custom 名字=命令模板] [--custom-local 名字]   自定义命令在本机 GPU 上跑（出图前要向 Strata 借 GPU）
+         [--strata-lease on|off] [--strata-url 地址] [--strata-env-file 路径]
+                                           出图前向本机 Strata 借 GPU、出完归还（见 SKILL.md「和本地大模型分时用 GPU」）
+         [--strata-min-free-vram MiB]      归还前等空闲显存至少这么多
+  lease acquire [--ttl 秒] | renew <id> [--ttl 秒] | release <id> | status
+                                           手动借 / 还 GPU（在 ComfyUI 网页里手动跑 workflow 前后用；acquire 默认 3600 秒）
   intake-template                          打印一次性输入的模板（给模型填）
   intake-check <intake.json>               校验并打印确认表；有问题 exit 1
   new <intake.json> --out <目录> [--look 画风]   建角色资产 <目录>/<角色名>/asset.json
@@ -346,10 +367,39 @@ async function main(argv) {
       if (i < 1) throw new Error('--custom 写成 名字=命令模板');
       cfg.models.custom[cu.slice(0, i)] = { cmd: cu.slice(i + 1) };
     }
+    const cl = flag(rest, '--custom-local');
+    if (cl) {
+      if (!cfg.models.custom[cl]) throw new Error(`没有自定义模型 ${cl}，先用 --custom ${cl}=命令模板 加上`);
+      cfg.models.custom[cl].local = true;
+    }
+    const sl = flag(rest, '--strata-lease');
+    const su = flag(rest, '--strata-url');
+    const se = flag(rest, '--strata-env-file');
+    const sv = flag(rest, '--strata-min-free-vram');
+    if (sl || su || se || sv) {
+      const lease = { ...(cfg.strataLease ?? {}) };
+      if (sl) {
+        if (!['on', 'off'].includes(sl)) throw new Error('--strata-lease 只能是 on / off');
+        lease.enabled = sl === 'on';
+      }
+      if (su) lease.url = su;
+      if (se) lease.envFile = resolve(se);
+      if (sv) {
+        if (!(Number(sv) >= 0)) throw new Error('--strata-min-free-vram 要一个 MiB 数');
+        lease.minFreeVramMib = Number(sv);
+      }
+      cfg.strataLease = lease;
+    }
     if (rest.some((a) => a.startsWith('--') && a !== '--show')) saveConfig(cfg);
     console.log(JSON.stringify(maskConfig(cfg), null, 2));
     const miss = configMissing(cfg);
     console.log(miss.length ? `\n还缺：${miss.join('、')}` : `\n✓ 配置完整（${CONFIG_PATH}）`);
+    return;
+  }
+
+  if (cmd === 'lease') {
+    const cfg = loadConfig();
+    console.log(JSON.stringify(await leaseCommand(rest, { ...leaseSettings(cfg.strataLease), holder: 'manual' }, comfyOf(cfg)), null, 2));
     return;
   }
 

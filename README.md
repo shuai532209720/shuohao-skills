@@ -210,6 +210,7 @@ Run every self-test before adding a skill:
 
 ```bash
 for f in skills/*/scripts/selftest.mjs; do node "$f"; done
+node scripts/check-shared.mjs   # files several skills carry a copy of (gpu-lease.mjs) must stay identical
 ```
 
 There is no CI — the self-tests run in about a second, so running them locally beats waiting on a pipeline. **Only tested on macOS with Node 24**; there is no platform-specific code, so Linux and older Node releases should be fine, but that is unverified.

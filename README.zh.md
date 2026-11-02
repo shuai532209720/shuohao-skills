@@ -209,6 +209,7 @@ skills/<skill-name>/
 
 ```bash
 for f in skills/*/scripts/selftest.mjs; do node "$f"; done
+node scripts/check-shared.mjs   # 几个 skill 各带一份的文件（gpu-lease.mjs）必须保持完全相同
 ```
 
 没有配 CI——自测足够快（1 秒），本地跑一次比等 CI 更省事。**只在 macOS + Node 24 上验过**；代码没有平台相关调用，Linux 和更低版本 Node 理论上没问题，但没验。

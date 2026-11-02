@@ -6,6 +6,7 @@
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { basename, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { videoMain } from './video.mjs';
 
 /* ------------------------------------------------------------------ */
 /* 常量                                                                */
@@ -1870,6 +1871,18 @@ const USAGE = `novel-storyboard.mjs — novel-storyboard skill 的确定性工�
                                               哪道门从没响过（validate/checkup 会自动累积）
   slug <name>                                 剧名转安全文件名
 
+  —— 用本机 ComfyUI 出视频（可选；见 SKILL.md「用本机 ComfyUI 出视频」）——
+  config [--comfy-url 地址] [--comfy-env-file 路径] [--timeout 秒]
+         [--strata-lease on|off] [--strata-url 地址] [--strata-env-file 路径] [--strata-min-free-vram MiB]
+                                              本机配置（skill 目录的 config.local.json）；strata-* 是向本机 Strata 借 GPU
+  video <投产包目录> --workflow <workflow.json>  逐段跑 ComfyUI 视频 workflow（API 格式，输入写成 {{prompt}}
+         [--segments E01-01,E01-02] [--force]   {{image1}}… {{seconds}} {{cuts}} {{seed}} {{segment}} 占位符），
+         [--seed n] [--detach]                视频存回段文件夹；整批只借一次 GPU；断了再跑从断点接着来。
+                                              --detach：后台运行（多段时必须用），立即返回
+  video-status <投产包目录>                    看 video 的进度（video-state.json）
+  lease acquire [--ttl 秒] | renew <id> | release <id> | status
+                                              手动借 / 还 GPU（在 ComfyUI 网页里手动跑前后用）
+
 validate 与 checkup 每次都会把门的结果追加到当前目录的 .gates.jsonl。
 积累几十次之后跑 stats，就知道模型最常违反哪条规则——那条规则的措辞该改。
 不想记就加 --no-log；写不进去会静默跳过，不影响校验本身。`;
@@ -1917,6 +1930,7 @@ function loadCtx(rest) {
 
 function main(argv) {
   const [cmd, ...rest] = argv;
+  if (['video', 'video-status', 'config', 'lease'].includes(cmd)) return videoMain(cmd, rest);   // 异步：返回 Promise
 
   if (!cmd || cmd === '-h' || cmd === '--help') {
     console.log(USAGE);
@@ -2126,10 +2140,14 @@ if (isMainModule()) {
     if (e.code === 'EPIPE') process.exit(0);
     throw e;
   });
-  try {
-    main(process.argv.slice(2));
-  } catch (error) {
+  const fail = (error) => {
     console.error(error instanceof Error ? error.message : error);
     process.exit(1);
+  };
+  try {
+    const r = main(process.argv.slice(2));
+    if (r && typeof r.then === 'function') r.then((code) => { if (code) process.exitCode = code; }, fail);
+  } catch (error) {
+    fail(error);
   }
 }

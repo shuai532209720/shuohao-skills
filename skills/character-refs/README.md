@@ -45,6 +45,11 @@ agent 拆进身份、脸、头发、身形、皮肤、上装、下装、细节�
 **主图和派生图可以使用不同模型，重出单张也能换。**一致性来自同一张锚点，不来自同一个模型——
 Qwen 锚点 + GPT 派生、GPT 锚点 + Qwen 派生、同一组里混用，实测都衔接得上。每张图记录自己的模型，混用只提醒。
 
+**和本地大模型分时用 GPU（可选）**：本地大模型跑在同一台机器的 Strata 上时，`config --strata-lease on --strata-env-file <.env>`
+让每批本机出图（`qwen`、标了 `--custom-local` 的自定义命令）前先向 Strata 借 GPU（它存好对话、卸载模型），出完让 ComfyUI
+释放显存再还回去。一批只借一次；`lease acquire` / `lease release` 给在 ComfyUI 网页里手动跑时用。细节见
+`references/models.md` 和 Strata 仓库的 `docs/GPU_LEASE.md`。
+
 ## 画风
 
 内置两个预设，名字中英文都认：
@@ -113,9 +118,10 @@ node scripts/character-refs.mjs render out/阿禾/asset.json --out out/character
 ```
 SKILL.md                    给 agent 读的工作流
 scripts/
-  character-refs.mjs  config / intake-check / new / gen / confirm / check / render
+  character-refs.mjs  config / intake-check / new / gen / confirm / check / render / lease
   core.mjs                  视图、提示词、输入校验、版本与过期、检查门
   models.mjs                四个出图适配器
+  gpu-lease.mjs             向本机 Strata 借 GPU（与 novel-storyboard 里那份完全相同）
   looks.mjs                 画风预设表（写实、动漫）
   i18n.mjs                  报告与确认表的界面文案（中英日）
   png.mjs                   PNG 读写与元数据（零依赖）
@@ -138,7 +144,7 @@ assets/
 node scripts/selftest.mjs
 ```
 
-233 项断言，不调模型、不花额度，Qwen 和 GPT Image 使用本地假服务器校验请求格式，完整流程使用自定义命令造的白底图跑通。
+276 项断言，不调模型、不花额度，Qwen 和 GPT Image 使用本地假服务器校验请求格式，完整流程使用自定义命令造的白底图跑通；向本机 Strata 借 GPU 用假的 Strata 与 ComfyUI 验过。
 
 ## 已知短板
 

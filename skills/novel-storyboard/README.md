@@ -116,9 +116,17 @@ node scripts/novel-storyboard.mjs export sb.json --script script.json   # H3 投
 
 `export` 的投产结构固定：**每段一个文件夹** `E01-01/`——分镜图 `f1..fN.png` 和 `prompt.md` 同住（头部 Picture ↔ 文件对照表**明确 f1.png 是首帧**、各图钉在第几秒，分隔线以下是 h3Prompt 原样），根部 `manifest.json` 带 Picture 序图清单、切点时刻表、缺图标注。一个段文件夹 = 一次 H3 生成的全部材料。
 
+## 可选：用本机 ComfyUI 出视频
+
+`video <投产包目录> --workflow <workflow.json>` 把投产包逐段喂给你在 ComfyUI 里做好的视频 workflow（API 格式导出，
+输入值写成 `{{prompt}}`、`{{image1}}`…、`{{seconds}}`、`{{cuts}}`、`{{seed}}`、`{{segment}}` 占位符），视频存回段文件夹，
+进度记在 `video-state.json`，断了再跑从断点接着来；`--detach` 后台跑，`video-status` 看进度。
+ComfyUI 和本地大模型（Strata）在同一台机器上时，`config --strata-lease on` 让它跑之前向 Strata 借 GPU、跑完归还（整批一次）。
+workflow 本身由你在 ComfyUI 里做。只用假的 ComfyUI 与 Strata 服务器验过，没有用真的视频 workflow 跑过。
+
 ## 边界
 
-- 不写戏不改台词、不出设定图、不做视频生成与剪辑合成
+- 不写戏不改台词、不出设定图、不做剪辑合成；视频生成只有可选的 `video` 命令（喂你自己的 ComfyUI workflow）
 - 口型/唇形同步暂不管——那是生成管线的事
 - 秒数是**下给视频模型的生成时长**不是估算；段上限、分镜节奏区间都在 `params` 里按模型调
 - 报告界面内置中英（`--lang`，默认中文）；提示词语言由 `promptLang` 单独控制（默认英文）
@@ -130,7 +138,9 @@ node scripts/novel-storyboard.mjs export sb.json --script script.json   # H3 投
 SKILL.md                 给 agent 读的工作流
 scripts/
   novel-storyboard.mjs   seed / validate / checkup / render / export / slug
-  selftest.mjs           336 项断言，不调模型
+  video.mjs              可选的 video 命令：投产包逐段喂本机 ComfyUI workflow
+  gpu-lease.mjs          向本机 Strata 借 GPU（与 character-refs 里那份完全相同）
+  selftest.mjs           364 项断言，不调模型
 references/
   schema.md              storyboard.json 结构 + 时长约束链
   h3-prompt.md           H3 提示词写法规范（官方方法论内化版）
@@ -149,6 +159,6 @@ assets/
 node scripts/selftest.mjs
 ```
 
-336 项断言，覆盖节拍展开 / H3 骨架推导 / Seedance 拼装 / 统计与批次 / 质量门逐项击穿 / 配方卡库解析与挂载 / seed / 渲染（含中英界面、图位画幅）/ H3 与 Seedance 导出。不调模型、不花额度、1 秒跑完。改完脚本先跑这个。
+364 项断言，覆盖节拍展开 / H3 骨架推导 / Seedance 拼装 / 统计与批次 / 质量门逐项击穿 / 配方卡库解析与挂载 / seed / 渲染（含中英界面、图位画幅）/ H3 与 Seedance 导出 / video 命令（假的 ComfyUI 与 Strata：占位符、断点续跑、后台运行、整批只借一次 GPU）。不调模型、不花额度、1 秒跑完。改完脚本先跑这个。
 
 **只在 macOS + Node 24 上实测过。** 代码没有平台相关调用，Linux 和更低版本 Node 理论上没问题，但**没验过**。

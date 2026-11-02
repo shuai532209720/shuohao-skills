@@ -5,7 +5,7 @@
 
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -24,6 +24,9 @@ import { renderHtml, safeName } from './character-refs.mjs';
 import { BUILTIN, UI, fmt, uiFor, uiMissing, uiTemplate } from './i18n.mjs';
 import { LOOKS, findLook, lookName, lookProblems, lookSnapshot } from './looks.mjs';
 import { lookHash } from './core.mjs';
+import {
+  LEASE_DEFAULTS, LeaseError, freeVramMib, leaseCommand, leaseEndpoint, leaseSettings, parseEnvText, waitResources, withLease,
+} from './gpu-lease.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const CLI = join(here, 'character-refs.mjs');
@@ -507,6 +510,145 @@ const serve = (handler) => new Promise((ok_) => {
   const one = renderHtml([{ asset: assetFromIntake(INTAKE), assetDir: TMP }], TMP);
   ok(!one.includes('<p class="legend">'), '没有过期的图就不显示图例');
   ok(one.includes('还没有锚点') && one.includes('第 0 档'), '一张图都没有时也能渲染');
+}
+
+
+/* ---------------- 向本机 Strata 借 GPU（gpu-lease.mjs） ---------------- */
+{
+  const LEASE_KEY = 'L'.repeat(40);
+  const envFile = join(TMP, 'lease.env');
+  writeFileSync(envFile, `# 和 Strata 共用的文件\nSTRATA_LEASE_KEY=${LEASE_KEY}\r\nSTRATA_API_KEY="chat-key"\n`);
+  // S7：.env 解析与 Strata 服务端 serve/gpu_lease.py 的 parse_env 用同一组样例
+  eq(parseEnvText('# x\nCOMFY_URL=http://h:1/\nCOMFY_PASS="p w"\n').COMFY_PASS, 'p w', '租约 .env：去引号、跳注释');
+  eq(JSON.stringify(parseEnvText("A=1\r\n  B = two \r\n#C=3\nD='q'\n=bad\n9X=1\nE=\n")), JSON.stringify({ A: '1', B: 'two ', D: 'q', E: '' }),
+    '租约 .env：CRLF、空格、坏行与 Strata 服务端解析一致');
+  eq(JSON.stringify(leaseSettings(null)), JSON.stringify(LEASE_DEFAULTS), '没配 strataLease：全是默认值，enabled 为 false');
+  const ep = leaseEndpoint({ ...LEASE_DEFAULTS, url: 'http://x:1/', envFile }, {});
+  ok(ep.url === 'http://x:1' && ep.headers['X-Strata-Lease-Key'] === LEASE_KEY && ep.headers.Authorization === 'Bearer chat-key', '租约：从 .env 取两个 key，分别放进各自的请求头');
+  eq(leaseEndpoint({ ...LEASE_DEFAULTS, envFile }, { STRATA_LEASE_KEY: 'from-env' }).headers['X-Strata-Lease-Key'], 'from-env', '环境变量优先于 .env 文件');
+  ok(!('Authorization' in leaseEndpoint(LEASE_DEFAULTS, {}).headers), '没有聊天 key 就不带 Authorization');
+  // S8：等显存与内存
+  {
+    let t = 0;
+    const clock = { now: () => t, sleep: async (ms) => { t += ms; } };
+    const vals = [1000, 3000, 9000];
+    const w = await waitResources({ minFreeVramMib: 8000, minFreeRamMib: 0, resourceWaitS: 60 }, { vram: () => vals.shift() ?? 9000, ram: () => 0, ...clock });
+    ok(w.ok && w.vram === 9000 && w.waitedS === 2, '等到显存空出来才返回');
+    t = 0;
+    const w2 = await waitResources({ minFreeVramMib: 8000, minFreeRamMib: 4000, resourceWaitS: 3 }, { vram: () => 9000, ram: () => 100, ...clock });
+    ok(!w2.ok && w2.waitedS === 3, '等不到：到时间就放弃（只警告）');
+    t = 0;
+    ok((await waitResources({ minFreeVramMib: 8000, resourceWaitS: 30 }, { vram: () => null, ...clock })).ok, '读不到显存（没有 nvidia-smi）就不等');
+    eq(freeVramMib(() => ({ status: 0, stdout: '15360\r\n8000\n' })), 15360, 'nvidia-smi：取第一张卡');
+    eq(freeVramMib(() => ({ status: 1, stdout: '' })), null, 'nvidia-smi 不可用：null');
+  }
+  // S1 / S4 / S5：withLease 本身
+  {
+    const calls = [];
+    const deps = {
+      acquire: async () => { calls.push('acquire'); return { lease_id: 'gl_a', policy: 'unload', conversation_saved: { tokens: 9 } }; },
+      renew: async () => { calls.push('renew'); return {}; },
+      release: async () => { calls.push('release'); return { reload: 'started' }; },
+      comfyFree: async () => { calls.push('free'); return null; },
+      waitResources: async () => { calls.push('wait'); return { ok: true }; },
+    };
+    const quiet = () => {};
+    eq(await withLease({ ...LEASE_DEFAULTS }, null, async (l) => (l === null ? 'ran' : 'no'), { deps, log: quiet }), 'ran', 'S1 没开：直接执行，不碰 Strata');
+    eq(calls.length, 0, 'S1 没开：一个请求都不发');
+    const on = { ...LEASE_DEFAULTS, enabled: true, ttlS: 3 };
+    eq(await withLease(on, { url: 'http://c' }, async (l) => { await new Promise((r) => setTimeout(r, 1300)); return l.lease_id; }, { deps, log: quiet }), 'gl_a', '开了：fn 拿到租约');
+    eq(calls.join(','), 'acquire,renew,free,wait,release', '顺序：申请 → 续期 → ComfyUI 释放 → 等资源 → 归还');
+    calls.length = 0;
+    await assert.rejects(withLease(on, { url: 'http://c' }, async () => { throw new Error('boom'); }, { deps, log: quiet }), /boom/); passed++;
+    eq(calls.join(','), 'acquire,free,wait,release', 'S4 出图出错：照样释放并归还');
+    calls.length = 0;
+    const busy = { ...deps, acquire: async () => { throw new LeaseError('Strata 返回 409 model_busy：x', { status: 409, code: 'model_busy' }); } };
+    let ran = false;
+    await assert.rejects(withLease(on, null, async () => { ran = true; }, { deps: busy, log: quiet }), /409 model_busy/); passed++;
+    ok(!ran && calls.length === 0, 'S5 申请失败：不出图，不归还');
+    const lost = { ...deps, renew: async () => { calls.push('renew'); throw new LeaseError('x', { status: 404 }); } };
+    const said = [];
+    await withLease(on, null, () => new Promise((r) => setTimeout(r, 1300)), { deps: lost, log: (m) => said.push(m) });
+    ok(said.some((m) => m.includes('已被 Strata 收回')) && !calls.includes('release'), '租约被收回（续期 404）：提示，不再归还');
+  }
+  // S2 / S3 / S6 / S9：真的 CLI，对着假的 Strata 与假的 ComfyUI
+  {
+    const seen = [];
+    const strata = await serve((req, res, body) => {
+      seen.push({ who: 'strata', method: req.method, url: req.url, lease: req.headers['x-strata-lease-key'], auth: req.headers.authorization, body: body.toString() });
+      res.setHeader('Content-Type', 'application/json');
+      if (req.headers['x-strata-lease-key'] !== LEASE_KEY) { res.statusCode = 403; res.end(JSON.stringify({ error: { code: 'gpu_lease_forbidden', message: 'missing or wrong lease key' } })); return; }
+      if (req.method === 'GET') res.end(JSON.stringify({ enabled: true, state: 'idle' }));
+      else if (req.url === '/v1/gpu/lease') res.end(JSON.stringify({ lease_id: 'gl_cli', policy: 'unload', conversation_saved: { tokens: 7, bytes: 1 } }));
+      else if (req.url.endsWith('/renew')) res.end(JSON.stringify({ status: 'renewed', expires_in_s: 600 }));
+      else if (req.url.endsWith('/release')) res.end(JSON.stringify({ status: 'released', reload: 'started' }));
+      else { res.statusCode = 404; res.end('{}'); }
+    });
+    const comfy = await serve((req, res, body) => {
+      seen.push({ who: 'comfy', url: req.url, body: body.toString() });
+      res.end('{}');
+    });
+    const runAsync = (env, ...a) => new Promise((ok_) => {
+      const p = spawn(process.execPath, [CLI, ...a], { env });
+      let out = '', err = '';
+      p.stdout.on('data', (d) => { out += d; });
+      p.stderr.on('data', (d) => { err += d; });
+      p.on('close', (status) => ok_({ status, stdout: out, stderr: err }));
+    });
+    const mk = join(TMP, 'mk-lease.mjs');
+    writeFileSync(mk, `import { writeFileSync } from 'node:fs';\nimport { solidPng } from ${JSON.stringify(pathToFileURL(join(here, 'png.mjs')).href)};\n` +
+      `const [w, h, out] = process.argv.slice(2); writeFileSync(out, solidPng(Math.round(w / 3), Math.round(h / 3)));\n`);
+    const cfgPath = join(TMP, 'config-lease.json');
+    const env = { ...process.env, CHARACTER_REFS_CONFIG: cfgPath };
+    delete env.STRATA_LEASE_KEY; delete env.STRATA_API_KEY; delete env.STRATA_URL;
+    const c1 = await runAsync(env, 'config', '--model', 'custom:white', '--confirm-anchor', 'no', '--custom', `white=node ${mk} {width} {height} {out}`,
+      '--custom-local', 'white', '--qwen-url', `http://127.0.0.1:${comfy.address().port}`,
+      '--strata-lease', 'on', '--strata-url', `http://127.0.0.1:${strata.address().port}`, '--strata-env-file', envFile);
+    ok(c1.status === 0 && !c1.stdout.includes(LEASE_KEY), 'config：开租约，配置里只记 .env 路径，不打印 key');
+    const saved = JSON.parse(readFileSync(cfgPath, 'utf8'));
+    ok(saved.strataLease.enabled === true && saved.strataLease.envFile === envFile && saved.models.custom.white.local === true, 'config：strataLease 与 local 标记写进配置');
+    const dir = join(TMP, 'lease-run');
+    await runAsync(env, 'new', join(here, '..', 'examples', '阿禾-intake.json'), '--out', dir);
+    const ap = join(dir, safeName('阿禾'), 'asset.json');
+    const g = await runAsync(env, 'gen', ap, '--no-confirm');
+    ok(g.status === 0 && ['front-full', 'face-front', 'side-full', 'back-full'].every((v) => g.stdout.includes(`${v}/v1`)), 'S2 一条命令出齐四张图\n' + g.stdout + g.stderr);
+    const st = seen.filter((x) => x.who === 'strata');
+    eq(st.filter((x) => x.url === '/v1/gpu/lease').length, 1, 'S2 整批只申请一次租约');
+    eq(st.filter((x) => x.url.endsWith('/release')).length, 1, 'S2 整批只归还一次');
+    const order = seen.map((x) => (x.who === 'comfy' ? 'free' : x.url.endsWith('/release') ? 'release' : x.url === '/v1/gpu/lease' ? 'acquire' : 'other'));
+    ok(order.indexOf('acquire') < order.indexOf('free') && order.indexOf('free') < order.indexOf('release'), 'S2 归还前先让 ComfyUI 释放');
+    eq(JSON.parse(seen.find((x) => x.who === 'comfy').body).unload_models, true, 'S2 /free 带 unload_models');
+    ok(st.every((x) => x.lease === LEASE_KEY && x.auth === 'Bearer chat-key'), 'S6 每个请求都带租约 key 和聊天 key');
+    ok(JSON.parse(st[0].body).holder === 'character-refs' && JSON.parse(st[0].body).policy === 'unload', 'S6 申请里带 holder 与策略');
+    ok(!(g.stdout + g.stderr).includes(LEASE_KEY) && !(g.stdout + g.stderr).includes('chat-key'), 'S6 输出里没有 key');
+    ok(g.stdout.includes('已借到 GPU') && g.stdout.includes('已把 GPU 还给 Strata'), 'S2 告诉用户借了、还了');
+    // S3：同一份配置，模型换成不在本机 GPU 上跑的
+    seen.length = 0;
+    const g2 = await runAsync(env, 'gen', ap, 'face-front', '--model', 'custom:remote');
+    ok(seen.length === 0, 'S3 不在本机 GPU 上的模型：不借 GPU' + g2.stderr);
+    // S5：申请被拒 → 不出图、退出码 1
+    writeFileSync(envFile, 'STRATA_LEASE_KEY=wrong-key-wrong-key-wrong-key-wrong\n');
+    seen.length = 0;
+    const g3 = await runAsync(env, 'gen', ap, 'face-front');
+    ok(g3.status === 1 && g3.stderr.includes('403') && !g3.stdout.includes('face-front/v'), 'S5 申请被拒：报错退出，不出图');
+    ok(!seen.some((x) => x.url?.endsWith('/release')), 'S5 没借到就不归还');
+    writeFileSync(envFile, `STRATA_LEASE_KEY=${LEASE_KEY}\n`);
+    // S9：手动 lease 子命令
+    const la = await runAsync(env, 'lease', 'acquire');
+    ok(la.status === 0 && JSON.parse(la.stdout).lease_id === 'gl_cli', 'S9 lease acquire 打印 lease_id');
+    eq(JSON.parse(seen.at(-1).body).ttl_s, 3600, 'S9 手动申请默认 3600 秒');
+    eq(JSON.parse(seen.at(-1).body).holder, 'manual', 'S9 手动申请的 holder 是 manual');
+    ok(JSON.parse((await runAsync(env, 'lease', 'status')).stdout).state === 'idle', 'S9 lease status');
+    ok(JSON.parse((await runAsync(env, 'lease', 'renew', 'gl_cli', '--ttl', '900')).stdout).status === 'renewed', 'S9 lease renew');
+    eq(JSON.parse(seen.at(-1).body).ttl_s, 900, 'S9 renew 带 --ttl');
+    seen.length = 0;
+    const lr = await runAsync(env, 'lease', 'release', 'gl_cli');
+    ok(lr.status === 0 && JSON.parse(lr.stdout).status === 'released' && seen[0].who === 'comfy', 'S9 lease release：先让 ComfyUI 释放再归还');
+    ok((await runAsync(env, 'lease', 'renew')).stderr.includes('lease_id'), 'S9 少了 id：给出用法');
+    strata.close();
+    comfy.close();
+    await assert.rejects(leaseCommand(['bogus'], LEASE_DEFAULTS, null), /不认识/); passed++;
+  }
 }
 
 rmSync(TMP, { recursive: true, force: true });

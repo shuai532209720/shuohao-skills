@@ -42,8 +42,9 @@ export const DEFAULT_CONFIG = {
       model: 'gpt-image-2',
       quality: 'high',        // 认脸敏感的编辑官方建议 high
     },
-    custom: {},               // { 名字: { cmd: "mytool --prompt-file {prompt_file} --ref {refs} --out {out} --size {width}x{height}" } }
+    custom: {},               // { 名字: { cmd: "mytool --prompt-file {prompt_file} --ref {refs} --out {out} --size {width}x{height}", local: true } }
   },
+  strataLease: null,          // 可选：出图前向本机 Strata 借 GPU（gpu-lease.mjs 的 LEASE_DEFAULTS）；不配就和以前一样
 };
 
 export function loadConfig(path = CONFIG_PATH) {
@@ -67,6 +68,13 @@ export function configMissing(cfg) {
   if (!cfg.deriveModel) m.push('派生图用哪个模型（默认与主图相同）');
   if (cfg.confirmAnchor === null || cfg.confirmAnchor === undefined) m.push('出完锚点是否停下来等人确认');
   return m;
+}
+
+/** 这个模型在本机 GPU 上跑（要先向 Strata 借 GPU）：qwen（本机 ComfyUI），或标了 local: true 的自定义命令。 */
+export function usesLocalGpu(name, cfg) {
+  const kind = modelKind(name);
+  if (kind === 'qwen') return true;
+  return kind === 'custom' && cfg.models.custom[name.slice('custom:'.length)]?.local === true;
 }
 
 export function modelKind(name) {

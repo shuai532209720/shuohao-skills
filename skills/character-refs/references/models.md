@@ -77,3 +77,22 @@ node scripts/character-refs.mjs config --model custom:mine
 | Qwen | Qwen + GPT 混用 | 衔接得上，细节图之间有轻微亮度差 |
 
 推荐：派生默认 qwen（快、不吃额度），出不好的单张使用 `gen <视图> --model codex` 重出。
+
+## 和本机 Strata 分时用 GPU（strataLease）
+
+`qwen` 和标了 `local: true` 的自定义命令在本机 GPU 上跑。配置里开了 `strataLease.enabled`，`gen` 出这批图前先
+`POST /v1/gpu/lease` 向 Strata 借 GPU，每 ttl/3 续期一次，出完 `POST /free` 让 ComfyUI 释放、等显存回到
+`minFreeVramMib`，再 `POST /v1/gpu/lease/<id>/release` 归还。实现在 `scripts/gpu-lease.mjs`（novel-storyboard 里有一份完全相同的）。
+
+| 配置（`strataLease`） | 默认 | |
+| --- | --- | --- |
+| `enabled` | `false` | 不开就和以前完全一样 |
+| `url` | `http://127.0.0.1:8080` | Strata 地址；环境变量 `STRATA_URL` 优先 |
+| `envFile` | 无 | 读 `STRATA_LEASE_KEY`、`STRATA_API_KEY`；环境变量优先 |
+| `policy` | `unload` | `unload` 显存和内存都让出；`shrink` 只让显存（要 `reserveMib`，Strata 开 `vram_elastic`） |
+| `ttlS` / `waitS` | 600 / 900 | 租约时长（被杀后最多这么久 Strata 收回）/ 申请时最多等多久 |
+| `freeComfy` | `true` | 归还前调 ComfyUI `/free` |
+| `minFreeVramMib` / `minFreeRamMib` / `resourceWaitS` | 0 / 0 / 120 | 归还前等资源空出来；等不到只警告 |
+
+没有用真的 Strata 跑过：只用假服务器验过请求，以及 Strata 仓库里用测试引擎跑通的一次端到端。
+

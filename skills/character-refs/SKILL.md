@@ -93,6 +93,32 @@ node {baseDir}/scripts/character-refs.mjs config --model qwen --confirm-anchor y
 配置写在 `{baseDir}/config.local.json`（不进版本控制，重新安装不会覆盖）。以后默认一直使用它，
 用户说「换成 xx」就重新跑 `config`。**不要把 .env 里的密码或 key 打印出来**，`config --show` 已经打码。
 
+### 和本地大模型分时用 GPU（可选）
+
+用户的大模型跑在**同一台机器**的 Strata 上、ComfyUI 也在这台机器上时，两者抢不到同一块显卡。开了这一项，
+用本机 GPU 出图（`qwen`，或标了 `--custom-local` 的自定义命令）前，脚本会先向 Strata **借 GPU**：
+Strata 存好对话、卸载模型；出完让 ComfyUI 释放显存，再还给 Strata，它重新加载、恢复对话。
+**一批图只借一次**。`codex` / `openai` 不在本机 GPU 上跑，不借。
+
+```bash
+node {baseDir}/scripts/character-refs.mjs config --strata-lease on --strata-env-file ~/.strata/lease.env \
+  [--strata-url http://127.0.0.1:8080] [--strata-min-free-vram 12000]
+```
+
+`.env` 里放 `STRATA_LEASE_KEY=...`（Strata 只服务本机、没设 key 时可以不放），Strata 设了聊天 key 再加一行
+`STRATA_API_KEY=...`；可以和 Strata 的 `gpu_lease_key_file` 是同一个文件。Strata 那边要在 `strata-<model>.json`
+里开 `"gpu_lease": true`（Strata 仓库 `docs/GPU_LEASE.md`）。
+
+规则：
+
+- **出图期间本地大模型会暂停**，出完后它要重新加载，下一次回复会慢一些。这是正常的，不要因为等待而重试，
+  也不要自己去调 Strata 的 `/unload`
+- **一次把这批要出的图都放进一条 `gen`**，不要一张一张地多次调用——每次调用都要卸载、重新加载一遍模型
+- 报错 `409 model_busy` / `lease_busy`：Strata 正忙或别的程序在用 GPU，稍后重试；`404 gpu_lease_disabled`：Strata 没开租约，
+  告诉用户，不要自己处理；`403`：key 不对或不在本机，告诉用户检查 `.env`
+- 用户要在 ComfyUI 网页里**手动**跑 workflow：先 `lease acquire`（打印 `lease_id`，默认 1 小时），跑完 `lease release <lease_id>`；
+  忘了还，Strata 到时间自己收回
+
 ### Step 1 — 一次性输入
 
 用户**一段话**描述角色就够了，不要一项一项问。你（模型）来拆：
@@ -236,8 +262,8 @@ node {baseDir}/scripts/character-refs.mjs render <asset.json>... --out <输出�
 node {baseDir}/scripts/selftest.mjs
 ```
 
-233 项断言，不调模型、不花额度：PNG 标识读写、检查门、输入校验、多语言确认表与报告、画风预设与换画风、提示词、过期传导、出图适配器的请求格式（Qwen 与 GPT Image 使用本地假服务器）、
-以及使用自定义命令跑通的完整流程。改完脚本先跑这个。
+276 项断言，不调模型、不花额度：PNG 标识读写、检查门、输入校验、多语言确认表与报告、画风预设与换画风、提示词、过期传导、出图适配器的请求格式（Qwen 与 GPT Image 使用本地假服务器）、
+使用自定义命令跑通的完整流程，以及向 Strata 借 GPU（假的 Strata 与 ComfyUI：一批只借一次、出错也归还、key 不外露）。改完脚本先跑这个。
 
 ## 自带样例
 

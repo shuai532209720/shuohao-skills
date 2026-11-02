@@ -11,6 +11,7 @@ description: |
   配音对齐单，含导出 JSON）。不出图——交付的是每格的画面提示词和它该挂哪些参考图。
   18 道质量门全部由脚本确定性检查（第 18 道 shot-recipe 可选：挂上 shot-recipes 卡库才查，不挂就明说跳过）；
   export 一键导出 H3 投产包（每段提示词 + 按 Picture 序的分镜图清单）。零依赖、零 API key，用当前会话额度。
+  可选：video 命令用本机 ComfyUI 的视频 workflow 把投产包逐段跑成视频，跑之前向本机 Strata 借 GPU、跑完归还。
   Use when asked to 分镜、出分镜、镜头表、切镜、storyboard for AI short drama。
 allowed-tools:
   - Read
@@ -143,6 +144,34 @@ node {baseDir}/scripts/novel-storyboard.mjs render <剧名>-storyboard.json --ht
     ├── f2.png …                   ← 子分镜图
     └── prompt.md                  ← H3 提示词（export 生成）
 ```
+
+### Step 5（可选）— 用本机 ComfyUI 出视频
+
+只在用户要**在本机**把投产包跑成视频时做。先一次性配置（存在 `{baseDir}/config.local.json`，不进版本控制）：
+
+```bash
+node {baseDir}/scripts/novel-storyboard.mjs config --comfy-url http://127.0.0.1:8188 \
+  [--strata-lease on --strata-env-file ~/.strata/lease.env --strata-min-free-vram 12000]
+```
+
+workflow 由用户在 ComfyUI 里做好、导出 API 格式（Export (API)），把每段要换的输入值改成占位符：
+`{{prompt}}`（H3 提示词）、`{{image1}}`…`{{imageN}}`（分镜图 f1..fN，脚本先上传）、`{{seconds}}`、`{{cuts}}`、`{{seed}}`、`{{segment}}`。
+**workflow 不是你写的**：用户没给就问，不要自己编节点。
+
+```bash
+node {baseDir}/scripts/novel-storyboard.mjs video <投产包目录> --workflow <workflow.json> --detach [--segments E01-01,E01-02]
+node {baseDir}/scripts/novel-storyboard.mjs video-status <投产包目录>
+```
+
+- 视频存回段文件夹（`E01-01/E01-01.mp4`），进度写在 `video-state.json`；**再跑同一条命令只跑失败和没跑的**，`--force` 全部重跑
+- 缺分镜图的段跳过并说明；workflow 里有不认识的占位符，开跑前就报错
+- **超过 1 段必须用 `--detach`**（后台跑，命令立即返回）：视频一段几分钟，整批常常超过工具调用的超时
+- 开了 `--strata-lease`：整批只向 Strata 借一次 GPU，**整批跑完之前本地大模型一直暂停**——你的下一次回复也要等它恢复。
+  所以 `--detach` 之后不要频繁轮询 `video-status`；告诉用户大概要多久，让用户来问进度
+- 报错 `409 model_busy` / `lease_busy` 稍后重试；`404 gpu_lease_disabled` / `403` 告诉用户检查 Strata 的配置和 `.env`，不要自己去调 Strata
+- 用户在 ComfyUI 网页里**手动**跑：先 `lease acquire`，跑完 `lease release <lease_id>`
+
+汇报：几段完成、几段失败（失败原因）、视频在哪。**没看过视频不要说「效果很好」。**
 
 ---
 

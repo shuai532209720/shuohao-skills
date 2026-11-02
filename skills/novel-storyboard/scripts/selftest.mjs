@@ -4,9 +4,13 @@
 // 证明它真的会拦，不是一个永远为真的假测试。
 
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { createServer } from 'node:http';
+import { spawn } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { fillWorkflow, h3FromPromptMd, outputFiles, placeholdersOf, planSegments } from './video.mjs';
 import {
   CAMERA_MOVES,
   DEFAULT_PARAMS,
@@ -928,5 +932,142 @@ ok(html.includes('老周'), 'html 里 ID 换成名字');
   const doc = withRecipe();
   ok(renderMarkdown(doc, CTX).includes('| ots-shot-reverse |'), '不挂卡库时配方列退回裸 id');
   ok(renderMarkdown(FIXTURE, CTX).includes('| — |'), '没引用配方的切在配方列写 —');
+}
+
+/* ---------------- 用本机 ComfyUI 出视频（video.mjs）+ 向 Strata 借 GPU ---------------- */
+{
+  // V1：占位符
+  const wf = { a: { inputs: { text: '{{prompt}}', seconds: '{{seconds}}', name: 'out/{{segment}}-x', img: '{{image2}}', n: 5, list: ['{{seed}}', 'k'] } } };
+  eq(placeholdersOf(wf).join(','), 'prompt,seconds,segment,image2,seed', '找出 workflow 用到的占位符');
+  const filled = fillWorkflow(wf, { prompt: 'P "q"', seconds: 12.5, segment: 'E01-02', image2: 'nsb/f2.png', seed: 7, cuts: 3 });
+  ok(filled.a.inputs.text === 'P "q"' && filled.a.inputs.seconds === 12.5 && filled.a.inputs.list[0] === 7, '整个是占位符：数字按数字填，文字原样');
+  eq(filled.a.inputs.name, 'out/E01-02-x', '嵌在字符串里：按字符串替换');
+  eq(filled.a.inputs.n, 5, '没占位符的值不动');
+  assert.throws(() => fillWorkflow(wf, { prompt: 'p', seconds: 1, segment: 's', seed: 1 }), /提供不了 \{\{image2\}\}/); passed++;
+  assert.throws(() => fillWorkflow({ a: '{{fps}}' }, {}), /不认识的占位符/); passed++;
+  eq(h3FromPromptMd('# E01-01 · H3 提示词\n\n- Picture 1 = f1.png\n\n---\n\nHow the reference\nline 2\n'), 'How the reference\nline 2', 'prompt.md：取分隔线以下');
+  eq(outputFiles({ 9: { gifs: [{ filename: 'v.mp4', subfolder: '', type: 'output' }] }, 10: { images: [{ filename: 'a.png' }], other: 1 } }).map((f) => f.filename).join(','), 'v.mp4,a.png', '输出：视频、图片都收');
+
+  // 投产包：export 出来，再放几张假分镜图
+  const TMPV = mkdtempSync(join(tmpdir(), 'novel-storyboard-video-'));
+  const pack = join(TMPV, 'pack');
+  const p = exportPack(FIXTURE, SCRIPT, { imageExists: () => true, dir: pack });
+  for (const f of p.files) { mkdirSync(dirname(f.path), { recursive: true }); writeFileSync(f.path, f.content); }
+  for (const m of p.manifest) for (const pic of m.pictures) writeFileSync(pic, Buffer.from(`png-${pic}`));
+  const manifest = JSON.parse(readFileSync(join(pack, 'manifest.json'), 'utf8'));
+  // V4：缺图跳过、点名、已完成跳过
+  unlinkSync(join(pack, 'E01-03', 'f2.png'));
+  const plan = planSegments(pack, manifest, { segments: {} }, { only: ['E01-01', 'E01-03', 'E09-99'] });
+  ok(plan.run.map((x) => x.segment).join() === 'E01-01' && plan.skipped.some((x) => x.segment === 'E01-03' && x.why.includes('f2.png')) && plan.skipped.some((x) => x.segment === 'E09-99'), 'V4 缺图的段跳过并说明；没有的段号也说明');
+
+  // 假的 ComfyUI 和假的 Strata
+  const seen = [];
+  let failOnce = new Set(['E01-02']);
+  let n = 0;
+  const serve = (handler) => new Promise((ok_) => {
+    const srv = createServer(async (req, res) => {
+      const body = await new Promise((r) => { const b = []; req.on('data', (d) => b.push(d)); req.on('end', () => r(Buffer.concat(b))); });
+      handler(req, res, body);
+    });
+    srv.listen(0, '127.0.0.1', () => ok_(srv));
+  });
+  const prompts = {};
+  const comfy = await serve((req, res, body) => {
+    seen.push({ who: 'comfy', url: req.url });
+    res.setHeader('Content-Type', 'application/json');
+    if (req.url === '/upload/image') {
+      const name = body.toString('latin1').match(/filename="([^"]+)"/)[1];
+      res.end(JSON.stringify({ name, subfolder: 'novel-storyboard' }));
+    } else if (req.url === '/prompt') {
+      const wf2 = JSON.parse(body).prompt;
+      const id = `p${++n}`;
+      prompts[id] = wf2;
+      res.end(JSON.stringify({ prompt_id: id, node_errors: {} }));
+    } else if (req.url.startsWith('/history/')) {
+      const id = req.url.slice(9);
+      const seg = prompts[id].save.inputs.filename_prefix.split('/')[1];
+      if (failOnce.has(seg)) { failOnce.delete(seg); res.end(JSON.stringify({ [id]: { status: { status_str: 'error', completed: false, messages: [['execution_error', { exception_message: 'CUDA out of memory' }]] }, outputs: {} } })); return; }
+      res.end(JSON.stringify({ [id]: { status: { status_str: 'success', completed: true }, outputs: { 9: { gifs: [{ filename: `${seg}_00001.mp4`, subfolder: 'video', type: 'output' }] } } } }));
+    } else if (req.url.startsWith('/view')) res.end(`video-of-${new URL(req.url, 'http://x').searchParams.get('filename')}`);
+    else if (req.url === '/free') res.end('{}');
+    else { res.statusCode = 404; res.end('{}'); }
+  });
+  const KEY = 'S'.repeat(40);
+  const strata = await serve((req, res, body) => {
+    seen.push({ who: 'strata', url: req.url, key: req.headers['x-strata-lease-key'], body: body.toString() });
+    res.setHeader('Content-Type', 'application/json');
+    if (req.url === '/v1/gpu/lease') res.end(JSON.stringify({ lease_id: 'gl_v', policy: 'unload', conversation_saved: null }));
+    else if (req.url.endsWith('/release')) res.end(JSON.stringify({ status: 'released', reload: 'started' }));
+    else res.end(JSON.stringify({ status: 'renewed' }));
+  });
+  const envFile = join(TMPV, 'lease.env');
+  writeFileSync(envFile, `STRATA_LEASE_KEY=${KEY}\n`);
+  const cfgPath = join(TMPV, 'config.json');
+  const env = { ...process.env, NOVEL_STORYBOARD_CONFIG: cfgPath };
+  delete env.COMFY_URL; delete env.STRATA_LEASE_KEY; delete env.STRATA_URL;
+  const CLI = join(here, 'novel-storyboard.mjs');
+  const run = (...a) => new Promise((ok_) => {
+    const c = spawn(process.execPath, [CLI, ...a], { env });
+    let out = '', err = '';
+    c.stdout.on('data', (d) => { out += d; });
+    c.stderr.on('data', (d) => { err += d; });
+    c.on('close', (status) => ok_({ status, stdout: out, stderr: err }));
+  });
+  const cf = await run('config', '--comfy-url', `http://127.0.0.1:${comfy.address().port}`, '--strata-lease', 'on',
+    '--strata-url', `http://127.0.0.1:${strata.address().port}`, '--strata-env-file', envFile);
+  ok(cf.status === 0 && JSON.parse(readFileSync(cfgPath, 'utf8')).strataLease.enabled === true, 'config：ComfyUI 地址与租约写进本机配置');
+  const wfPath = join(TMPV, 'wf.json');
+  writeFileSync(wfPath, JSON.stringify({
+    load1: { class_type: 'LoadImage', inputs: { image: '{{image1}}' } },
+    enc: { class_type: 'TextEncode', inputs: { text: '{{prompt}}', length: '{{seconds}}', seed: '{{seed}}' } },
+    save: { class_type: 'SaveVideo', inputs: { filename_prefix: 'video/{{segment}}' } },
+  }));
+  // V2：整批一个租约，逐段跑，视频存回段文件夹；V3：失败的段记下来
+  const v1 = await run('video', pack, '--workflow', wfPath, '--segments', 'E01-01,E01-02', '--seed', '11');
+  ok(v1.status === 1 && v1.stdout.includes('✓ E01-01') && v1.stdout.includes('✗ E01-02：ComfyUI 执行出错：CUDA out of memory'), 'V2/V3 一段成功一段失败，退出码 1\n' + v1.stdout + v1.stderr);
+  eq(readFileSync(join(pack, 'E01-01', 'E01-01.mp4'), 'utf8'), 'video-of-E01-01_00001.mp4', 'V2 视频存回段文件夹，按段号命名');
+  const st = seen.filter((x) => x.who === 'strata');
+  ok(st.filter((x) => x.url === '/v1/gpu/lease').length === 1 && st.filter((x) => x.url.endsWith('/release')).length === 1, 'V2 两段只借一次 GPU、还一次');
+  ok(st.every((x) => x.key === KEY) && JSON.parse(st[0].body).holder === 'novel-storyboard', 'V2 带租约 key 与 holder');
+  const order = seen.map((x) => (x.url === '/v1/gpu/lease' ? 'A' : x.url === '/prompt' ? 'P' : x.url === '/free' ? 'F' : x.url.endsWith('/release') ? 'R' : '')).join('');
+  ok(/^A.*P.*P.*F.*R$/.test(order), `V2 顺序：借 → 跑两段 → ComfyUI 释放 → 还（${order}）`);
+  const p1 = prompts.p1;
+  ok(p1.enc.inputs.text.startsWith('How the reference') && p1.enc.inputs.length === manifest.find((m) => m.segment === 'E01-01').seconds && p1.enc.inputs.seed === 11, 'V2 提示词、秒数、种子换进 workflow');
+  eq(p1.load1.inputs.image, 'novel-storyboard/E01-01-f1.png', 'V2 分镜图先上传，再填上传后的名字');
+  let state = JSON.parse(readFileSync(join(pack, 'video-state.json'), 'utf8'));
+  ok(state.segments['E01-01'].status === 'done' && state.segments['E01-02'].status === 'failed' && !state.running, 'V3 状态文件记下每段结果');
+  // V3：再跑只重跑失败的；--force 全部重跑
+  seen.length = 0;
+  const v2 = await run('video', pack, '--workflow', wfPath, '--segments', 'E01-01,E01-02');
+  ok(v2.status === 0 && v2.stdout.includes('E01-01：跳过（已完成）') && v2.stdout.includes('✓ E01-02'), 'V3 再跑：跳过完成的，只跑失败的');
+  eq(seen.filter((x) => x.url === '/prompt').length, 1, 'V3 只提交了一段');
+  seen.length = 0;
+  const v3 = await run('video', pack, '--workflow', wfPath, '--segments', 'E01-01,E01-02', '--force');
+  ok(v3.status === 0 && seen.filter((x) => x.url === '/prompt').length === 2, 'V3 --force：全部重跑');
+  seen.length = 0;
+  const v4 = await run('video', pack, '--workflow', wfPath, '--segments', 'E01-01');
+  ok(v4.stdout.includes('没有要跑的段') && !seen.some((x) => x.who === 'strata'), '没有要跑的段：不借 GPU');
+  // V5：--detach 后台跑，video-status 看进度
+  seen.length = 0;
+  const d = await run('video', pack, '--workflow', wfPath, '--segments', 'E01-04,E01-05', '--detach');
+  ok(d.status === 0 && d.stdout.includes('已在后台运行'), 'V5 --detach 立即返回\n' + d.stdout + d.stderr);
+  for (let i = 0; i < 100; i++) {
+    state = existsSync(join(pack, 'video-state.json')) ? JSON.parse(readFileSync(join(pack, 'video-state.json'), 'utf8')) : {};
+    if (state.segments?.['E01-05']?.status === 'done' && !state.running) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  ok(state.segments['E01-04'].status === 'done' && state.segments['E01-05'].status === 'done', 'V5 后台进程跑完两段');
+  const vs = await run('video-status', pack);
+  ok(vs.stdout.includes('没有在运行') && vs.stdout.includes('✓ E01-05'), 'V5 video-status 读状态文件');
+  ok(readFileSync(join(pack, 'video.log'), 'utf8').includes('✓ E01-05'), 'V5 后台输出写进 video.log');
+  // 坏 workflow：开跑前就拦下，不借 GPU
+  seen.length = 0;
+  writeFileSync(wfPath, JSON.stringify({ a: { inputs: { fps: '{{fps}}' } } }));
+  const bad = await run('video', pack, '--workflow', wfPath, '--segments', 'E01-06');
+  ok(bad.status === 1 && bad.stderr.includes('不认识的占位符') && !seen.some((x) => x.who === 'strata'), '不认识的占位符：开跑前报错，不借 GPU');
+  ok((await run('video', pack)).stderr.includes('用法'), '少了 --workflow：给出用法');
+  comfy.close();
+  strata.close();
+  rmSync(TMPV, { recursive: true, force: true });
 }
 console.log(`✓ ${passed} 项自测全部通过`);
